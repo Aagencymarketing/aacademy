@@ -1,0 +1,80 @@
+# Flusso di lavoro di Jarvis per i progetti dei clienti.
+# Jarvis lo copia da solo in ogni repository che accendete nel pannello, come:
+#   .github/workflows/jarvis.yml
+# insieme al segreto CLAUDE_CODE_OAUTH_TOKEN (vedi docs/SETUP.md, "Progetti dei clienti").
+#
+# Cosa fa: quando Jarvis lo avvia, Claude Code fa la modifica chiesta, poi questo
+# flusso la mette su un ramo "jarvis/..." e apre una proposta di modifica (pull request).
+# Non pubblica niente da solo: l'unione al ramo principale la fa Jarvis, dopo il vostro sì.
+
+name: Jarvis
+run-name: "Jarvis ${{ github.event.client_payload.id }}"
+
+on:
+  repository_dispatch:
+    types: [jarvis-modifica]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: jarvis-${{ github.event.client_payload.id }}
+
+jobs:
+  modifica:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.client_payload.base }}
+          fetch-depth: 0
+
+      - name: Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm install),Bash(npm ci),Bash(npm run *),Bash(npx tsc *),Bash(git status),Bash(git diff *)"
+          prompt: |
+            Lavori sul progetto ${{ github.repository }} per conto di AAgency. La richiesta arriva
+            dai titolari, a voce, tramite Jarvis:
+
+            <richiesta>
+            ${{ github.event.client_payload.istruzioni }}
+            </richiesta>
+
+            Regole:
+            - fai solo quello che è chiesto, con modifiche piccole e nello stile del codice esistente;
+            - se nel progetto c'è un comando di build, lint o test, lancialo e sistema gli errori che introduci tu;
+            - non fare commit né push: ci pensa il flusso di lavoro;
+            - non toccare segreti, variabili d'ambiente, impostazioni di deploy o questo file;
+            - se la richiesta è ambigua o rischiosa, non modificare niente e spiega il motivo.
+
+      - name: Proposta di modifica
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ github.event.client_payload.id }}
+          TITOLO: ${{ github.event.client_payload.titolo }}
+          ISTRUZIONI: ${{ github.event.client_payload.istruzioni }}
+          BASE: ${{ github.event.client_payload.base }}
+        run: |
+          set -euo pipefail
+          [[ "$ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "id non valido"; exit 1; }
+          RAMO="jarvis/${ID:0:8}"
+          git config user.name "Jarvis (AAgency)"
+          git config user.email "jarvis-aagency@users.noreply.github.com"
+          git checkout -B "$RAMO"
+          git add -A
+          git diff --cached --quiet || git commit -m "$TITOLO" -m "Richiesta a Jarvis: $ISTRUZIONI"
+          if [ "$(git rev-list --count "origin/$BASE..HEAD")" = "0" ]; then
+            echo "Nessuna modifica: niente da proporre."
+            exit 0
+          fi
+          git push -u origin "$RAMO"
+          gh pr create --base "$BASE" --head "$RAMO" --title "$TITOLO" \
+            --body "$(printf 'Richiesta a Jarvis:\n\n> %s\n\nPreparata da Claude Code. Si pubblica solo dopo il sì dei titolari.' "$ISTRUZIONI")"
